@@ -260,6 +260,7 @@ bot.hears(/https?:\/\/[^\s]+/, async (ctx) => {
       title: scrapedData.title || undefined,
       image: scrapedData.image || undefined,
       price: scrapedData.price || undefined,
+      originalPrice: scrapedData.originalPrice || undefined,
       storeName,
       affiliateLink: url,
     };
@@ -270,6 +271,10 @@ bot.hears(/https?:\/\/[^\s]+/, async (ctx) => {
     message += `🏪 Loja: ${storeName}\n`;
     message += `📝 Titulo: ${scrapedData.title || '❌ Nao encontrado'}\n`;
     message += `💰 Preco: ${scrapedData.price ? `R$ ${scrapedData.price.toFixed(2)}` : '❌ Nao encontrado'}\n`;
+    if (scrapedData.originalPrice) {
+      const discount = Math.round(((scrapedData.originalPrice - (scrapedData.price || 0)) / scrapedData.originalPrice) * 100);
+      message += `💵 Preco Original: R$ ${scrapedData.originalPrice.toFixed(2)} (${discount}% OFF)\n`;
+    }
     message += `🖼️ Imagem: ${scrapedData.image ? '✅ Encontrada' : '❌ Nao encontrada'}\n\n`;
     message += 'Voce pode editar os campos ou publicar diretamente:';
 
