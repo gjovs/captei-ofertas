@@ -1,0 +1,55 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Product {
+  id            String   @id @default(cuid())
+  title         String
+  affiliateLink String
+  originalLink  String
+  image         String
+  price         Float
+  originalPrice Float?
+  couponCode    String?
+  storeName     String   // Amazon, Shopee, Magalu, etc.
+  category      String?  // Electronics, Fashion, Home, etc.
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([createdAt])
+  @@index([storeName])
+  @@index([category])
+}
+
+model Post {
+  id        String   @id @default(cuid())
+  title     String
+  slug      String   @unique
+  content   String   @db.Text
+  published Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([slug])
+  @@index([published])
+}
+
+// Store conversation state for Telegram Bot
+model BotSession {
+  id        String   @id @default(cuid())
+  chatId    BigInt   @unique
+  state     String   // IDLE, WAITING_PRICE, WAITING_TITLE, etc.
+  data      Json?    // Temporary storage for scraped data
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([chatId])
+}
