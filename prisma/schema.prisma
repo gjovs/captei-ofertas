@@ -53,3 +53,17 @@ model BotSession {
 
   @@index([chatId])
 }
+
+// Telegram groups where the bot will broadcast products/posts
+model TelegramGroup {
+  id              String   @id @default(cuid())
+  chatId          BigInt   @unique  // Telegram group/channel ID
+  title           String             // Group name
+  notifyProducts  Boolean  @default(true)   // Send new product notifications?
+  notifyBlog      Boolean  @default(true)   // Send new blog post notifications?
+  addedAt         DateTime @default(now())
+
+  @@index([chatId])
+  @@index([notifyProducts])
+  @@index([notifyBlog])
+}

@@ -3,11 +3,20 @@ import { prisma } from '@/lib/db';
 import { scrapeUrl } from '@/lib/scraper';
 import { getStoreName } from '@/lib/utils';
 import { revalidatePath } from 'next/cache';
+import { 
+  broadcastProduct, 
+  broadcastBlogPost, 
+  notifyAdmins, 
+  getGroups,
+  toggleGroupSetting,
+  buildProductMessage 
+} from '@/lib/telegram-broadcast';
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) throw new Error('TELEGRAM_BOT_TOKEN is not set');
 
-const ADMIN_TELEGRAM_ID = process.env.ADMIN_TELEGRAM_ID;
+// Support multiple admin IDs (comma-separated)
+const ADMIN_TELEGRAM_IDS = process.env.ADMIN_TELEGRAM_IDS?.split(',').map(id => id.trim()) || [];
 
 const bot = new Bot(token);
 
@@ -45,21 +54,39 @@ interface SessionData {
 
 // Check if user is admin
 function isAdmin(ctx: Context): boolean {
-  if (!ADMIN_TELEGRAM_ID) {
-    console.warn('ADMIN_TELEGRAM_ID not set - bot is open to all users');
+  if (ADMIN_TELEGRAM_IDS.length === 0) {
+    console.warn('ADMIN_TELEGRAM_IDS not set - bot is open to all users');
     return true;
   }
   const userId = ctx.from?.id?.toString();
-  return userId === ADMIN_TELEGRAM_ID;
+  return userId ? ADMIN_TELEGRAM_IDS.includes(userId) : false;
 }
 
-// Middleware to check admin access
+// Check if chat is private (not a group)
+function isPrivateChat(ctx: Context): boolean {
+  return ctx.chat?.type === 'private';
+}
+
+// Middleware to check admin access (only for private chats)
 async function checkAdmin(ctx: Context, next: () => Promise<void>) {
+  // Allow group events (join/leave) to pass through
+  if (ctx.myChatMember) {
+    await next();
+    return;
+  }
+
+  // In groups, only respond to specific commands from anyone (for now, just ignore non-admin messages)
+  if (!isPrivateChat(ctx)) {
+    // Don't respond in groups unless it's a specific allowed action
+    return;
+  }
+
+  // In private chat, check if user is admin
   if (!isAdmin(ctx)) {
     await ctx.reply(
       '⛔ Acesso negado.\n\n' +
       'Este bot e restrito apenas para administradores.\n' +
-      'Se voce e o administrador, verifique se seu ADMIN_TELEGRAM_ID esta configurado corretamente.'
+      'Se voce e o administrador, verifique se seu ADMIN_TELEGRAM_IDS esta configurado corretamente.'
     );
     return;
   }
@@ -68,6 +95,237 @@ async function checkAdmin(ctx: Context, next: () => Promise<void>) {
 
 // Apply admin middleware to all updates
 bot.use(checkAdmin);
+
+// ==================== GROUP MANAGEMENT ====================
+
+// Handle bot being added to or removed from groups
+bot.on('my_chat_member', async (ctx) => {
+  const chat = ctx.chat;
+  const newStatus = ctx.myChatMember.new_chat_member.status;
+  const oldStatus = ctx.myChatMember.old_chat_member.status;
+
+  // Only handle group/supergroup chats
+  if (chat.type !== 'group' && chat.type !== 'supergroup') {
+    return;
+  }
+
+  const chatId = BigInt(chat.id);
+  const chatTitle = chat.title || 'Grupo sem nome';
+
+  // Bot was added to group
+  if ((oldStatus === 'left' || oldStatus === 'kicked') && 
+      (newStatus === 'member' || newStatus === 'administrator')) {
+    
+    try {
+      // Save group to database
+      await prisma.telegramGroup.upsert({
+        where: { chatId },
+        update: { title: chatTitle },
+        create: {
+          chatId,
+          title: chatTitle,
+          notifyProducts: true,
+          notifyBlog: true,
+        },
+      });
+
+      console.log(`Bot added to group: ${chatTitle} (${chatId})`);
+      
+      // Notify admins
+      await notifyAdmins(
+        `🤖 *Bot adicionado ao grupo!*\n\n` +
+        `📱 Grupo: *${chatTitle}*\n` +
+        `🆔 ID: \`${chatId}\`\n\n` +
+        `_Notificacoes de produtos e blog ativadas._\n` +
+        `Use /grupos para gerenciar.`
+      );
+    } catch (error) {
+      console.error('Error saving group:', error);
+    }
+  }
+
+  // Bot was removed from group
+  if ((oldStatus === 'member' || oldStatus === 'administrator') && 
+      (newStatus === 'left' || newStatus === 'kicked')) {
+    
+    try {
+      // Remove group from database
+      await prisma.telegramGroup.delete({
+        where: { chatId },
+      }).catch(() => {}); // Ignore if not found
+
+      console.log(`Bot removed from group: ${chatTitle} (${chatId})`);
+      
+      // Notify admins
+      await notifyAdmins(
+        `🚫 *Bot removido do grupo!*\n\n` +
+        `📱 Grupo: *${chatTitle}*\n` +
+        `🆔 ID: \`${chatId}\``
+      );
+    } catch (error) {
+      console.error('Error removing group:', error);
+    }
+  }
+});
+
+// ==================== GROUP COMMANDS ====================
+
+// List all groups
+bot.command('grupos', async (ctx) => {
+  if (!isPrivateChat(ctx)) {
+    await ctx.reply('⚠️ Este comando so funciona no chat privado com o bot.');
+    return;
+  }
+
+  const groups = await getGroups();
+
+  if (groups.length === 0) {
+    await ctx.reply(
+      '📭 *Nenhum grupo cadastrado*\n\n' +
+      'Adicione o bot a um grupo do Telegram para comecar a enviar notificacoes.',
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
+  let message = '📋 *Grupos cadastrados:*\n\n';
+  
+  groups.forEach((group, index) => {
+    const productStatus = group.notifyProducts ? '✅' : '❌';
+    const blogStatus = group.notifyBlog ? '✅' : '❌';
+    
+    message += `*${index + 1}. ${group.title}*\n`;
+    message += `   📦 Produtos: ${productStatus}\n`;
+    message += `   📝 Blog: ${blogStatus}\n`;
+    message += `   🆔 \`${group.chatId}\`\n\n`;
+  });
+
+  message += '_Para gerenciar um grupo, use:_\n';
+  message += '`/grupo [numero]` (ex: /grupo 1)';
+
+  await ctx.reply(message, { parse_mode: 'Markdown' });
+});
+
+// Manage specific group
+bot.hears(/^\/grupo\s+(\d+)$/, async (ctx) => {
+  if (!isPrivateChat(ctx)) {
+    await ctx.reply('⚠️ Este comando so funciona no chat privado com o bot.');
+    return;
+  }
+
+  const groupIndex = parseInt(ctx.match[1]) - 1;
+  const groups = await getGroups();
+
+  if (groupIndex < 0 || groupIndex >= groups.length) {
+    await ctx.reply(`❌ Grupo nao encontrado. Use /grupos para ver a lista.`);
+    return;
+  }
+
+  const group = groups[groupIndex];
+
+  const keyboard = new InlineKeyboard()
+    .text(
+      group.notifyProducts ? '📦 Produtos: ON' : '📦 Produtos: OFF',
+      `toggle_products_${group.chatId}`
+    )
+    .row()
+    .text(
+      group.notifyBlog ? '📝 Blog: ON' : '📝 Blog: OFF',
+      `toggle_blog_${group.chatId}`
+    )
+    .row()
+    .text('🗑️ Remover grupo', `remove_group_${group.chatId}`);
+
+  await ctx.reply(
+    `⚙️ *Configuracoes do grupo*\n\n` +
+    `📱 *${group.title}*\n` +
+    `🆔 \`${group.chatId}\`\n\n` +
+    `Clique nos botoes para alternar as notificacoes:`,
+    { parse_mode: 'Markdown', reply_markup: keyboard }
+  );
+});
+
+// Handle group management callbacks
+bot.callbackQuery(/^toggle_products_(-?\d+)$/, async (ctx) => {
+  const chatId = BigInt(ctx.match[1]);
+  const newValue = await toggleGroupSetting(chatId, 'notifyProducts');
+  
+  if (newValue === null) {
+    await ctx.answerCallbackQuery({ text: 'Grupo nao encontrado!' });
+    return;
+  }
+
+  const group = await prisma.telegramGroup.findUnique({ where: { chatId } });
+  if (!group) return;
+
+  const keyboard = new InlineKeyboard()
+    .text(
+      group.notifyProducts ? '📦 Produtos: ON' : '📦 Produtos: OFF',
+      `toggle_products_${group.chatId}`
+    )
+    .row()
+    .text(
+      group.notifyBlog ? '📝 Blog: ON' : '📝 Blog: OFF',
+      `toggle_blog_${group.chatId}`
+    )
+    .row()
+    .text('🗑️ Remover grupo', `remove_group_${group.chatId}`);
+
+  await ctx.editMessageReplyMarkup({ reply_markup: keyboard });
+  await ctx.answerCallbackQuery({ 
+    text: `Produtos: ${newValue ? 'Ativado' : 'Desativado'}` 
+  });
+});
+
+bot.callbackQuery(/^toggle_blog_(-?\d+)$/, async (ctx) => {
+  const chatId = BigInt(ctx.match[1]);
+  const newValue = await toggleGroupSetting(chatId, 'notifyBlog');
+  
+  if (newValue === null) {
+    await ctx.answerCallbackQuery({ text: 'Grupo nao encontrado!' });
+    return;
+  }
+
+  const group = await prisma.telegramGroup.findUnique({ where: { chatId } });
+  if (!group) return;
+
+  const keyboard = new InlineKeyboard()
+    .text(
+      group.notifyProducts ? '📦 Produtos: ON' : '📦 Produtos: OFF',
+      `toggle_products_${group.chatId}`
+    )
+    .row()
+    .text(
+      group.notifyBlog ? '📝 Blog: ON' : '📝 Blog: OFF',
+      `toggle_blog_${group.chatId}`
+    )
+    .row()
+    .text('🗑️ Remover grupo', `remove_group_${group.chatId}`);
+
+  await ctx.editMessageReplyMarkup({ reply_markup: keyboard });
+  await ctx.answerCallbackQuery({ 
+    text: `Blog: ${newValue ? 'Ativado' : 'Desativado'}` 
+  });
+});
+
+bot.callbackQuery(/^remove_group_(-?\d+)$/, async (ctx) => {
+  const chatId = BigInt(ctx.match[1]);
+  
+  try {
+    const group = await prisma.telegramGroup.delete({
+      where: { chatId },
+    });
+    
+    await ctx.editMessageText(
+      `🗑️ Grupo removido: *${group.title}*\n\n` +
+      `_O bot ainda esta no grupo. Remova-o manualmente se desejar._`,
+      { parse_mode: 'Markdown' }
+    );
+    await ctx.answerCallbackQuery({ text: 'Grupo removido!' });
+  } catch {
+    await ctx.answerCallbackQuery({ text: 'Erro ao remover grupo!' });
+  }
+});
 
 // Helper to get/update session
 async function getSession(chatId: number) {
@@ -112,6 +370,9 @@ bot.command('start', async (ctx) => {
     '*Blog:*\n' +
     '/newpost - Criar novo post\n' +
     '/posts - Listar posts\n\n' +
+    '*Grupos:*\n' +
+    '/grupos - Listar grupos cadastrados\n' +
+    '/grupo [n] - Gerenciar grupo especifico\n\n' +
     '*Outros:*\n' +
     '/help - Ver todos os comandos\n' +
     '/cancel - Cancelar operacao atual',
@@ -132,6 +393,9 @@ bot.command('help', async (ctx) => {
     '/posts - Listar todos os posts\n' +
     '/publish\\_post\\_ID - Publicar post (ex: /publish\\_post\\_abc123)\n' +
     '/delete\\_post\\_ID - Deletar post\n\n' +
+    '*Grupos (broadcast):*\n' +
+    '/grupos - Listar grupos onde o bot esta\n' +
+    '/grupo [n] - Configurar notificacoes do grupo\n\n' +
     '*Geral:*\n' +
     '/start - Menu inicial\n' +
     '/cancel - Cancelar operacao\n' +
@@ -205,10 +469,23 @@ bot.hears(/^\/publish_post_(.+)$/, async (ctx) => {
     revalidatePath('/blog');
     revalidatePath(`/blog/${post.slug}`);
 
-    await ctx.reply(
-      `✅ Post publicado!\n\n*${post.title}*\n\nAcesse: /blog/${post.slug}`,
-      { parse_mode: 'Markdown' }
-    );
+    // Broadcast to groups
+    const broadcastResult = await broadcastBlogPost({
+      id: post.id,
+      title: post.title,
+      slug: post.slug,
+    });
+
+    let message = `✅ Post publicado!\n\n*${post.title}*\n\nAcesse: /blog/${post.slug}`;
+    
+    if (broadcastResult.success > 0 || broadcastResult.failed > 0) {
+      message += `\n\n📢 Broadcast: ${broadcastResult.success} grupos`;
+      if (broadcastResult.failed > 0) {
+        message += ` (${broadcastResult.failed} falhas)`;
+      }
+    }
+
+    await ctx.reply(message, { parse_mode: 'Markdown' });
   } catch {
     await ctx.reply('❌ Post nao encontrado. Verifique o ID.');
   }
@@ -365,6 +642,54 @@ bot.on('callback_query:data', async (ctx) => {
   }
 
   const action = ctx.callbackQuery.data;
+  
+  // Handle blog publish from inline button
+  if (action.startsWith('publish_blog_')) {
+    const postId = action.replace('publish_blog_', '');
+    
+    try {
+      const post = await prisma.post.update({
+        where: { id: postId },
+        data: { published: true },
+      });
+
+      revalidatePath('/blog');
+      revalidatePath(`/blog/${post.slug}`);
+
+      // Broadcast to groups
+      const broadcastResult = await broadcastBlogPost({
+        id: post.id,
+        title: post.title,
+        slug: post.slug,
+      });
+
+      let message = `✅ *Post publicado!*\n\n📝 *${post.title}*\n🔗 /blog/${post.slug}`;
+      
+      if (broadcastResult.success > 0 || broadcastResult.failed > 0) {
+        message += `\n\n📢 Enviado para ${broadcastResult.success} grupos`;
+        if (broadcastResult.failed > 0) {
+          message += ` (${broadcastResult.failed} falhas)`;
+        }
+      }
+
+      await ctx.editMessageText(message, { parse_mode: 'Markdown' });
+      await ctx.answerCallbackQuery({ text: 'Post publicado!' });
+    } catch {
+      await ctx.answerCallbackQuery({ text: 'Erro ao publicar.' });
+    }
+    return;
+  }
+  
+  if (action === 'keep_draft') {
+    await ctx.editMessageText(
+      ctx.callbackQuery.message?.text + '\n\n_Mantido como rascunho. Use /posts para ver._',
+      { parse_mode: 'Markdown' }
+    );
+    await ctx.answerCallbackQuery({ text: 'Mantido como rascunho.' });
+    return;
+  }
+
+  // Handle product actions
   const session = await getSession(chatId);
   
   if (!session) {
@@ -578,41 +903,6 @@ bot.on('message:text', async (ctx) => {
   }
 });
 
-// Handle blog publish from inline button
-bot.on('callback_query:data', async (ctx) => {
-  const action = ctx.callbackQuery.data;
-
-  if (action.startsWith('publish_blog_')) {
-    const postId = action.replace('publish_blog_', '');
-    
-    try {
-      const post = await prisma.post.update({
-        where: { id: postId },
-        data: { published: true },
-      });
-
-      revalidatePath('/blog');
-      revalidatePath(`/blog/${post.slug}`);
-
-      await ctx.editMessageText(
-        `✅ *Post publicado!*\n\n` +
-        `📝 *${post.title}*\n` +
-        `🔗 /blog/${post.slug}`,
-        { parse_mode: 'Markdown' }
-      );
-      await ctx.answerCallbackQuery({ text: 'Post publicado!' });
-    } catch {
-      await ctx.answerCallbackQuery({ text: 'Erro ao publicar.' });
-    }
-  } else if (action === 'keep_draft') {
-    await ctx.editMessageText(
-      ctx.callbackQuery.message?.text + '\n\n_Mantido como rascunho. Use /posts para ver._',
-      { parse_mode: 'Markdown' }
-    );
-    await ctx.answerCallbackQuery({ text: 'Mantido como rascunho.' });
-  }
-});
-
 async function publishProduct(ctx: Context, data: SessionData) {
   try {
     if (!data.title || !data.price || !data.image || !data.url) {
@@ -643,6 +933,16 @@ async function publishProduct(ctx: Context, data: SessionData) {
     revalidatePath('/');
     revalidatePath('/promocoes-do-dia');
 
+    // Broadcast to groups
+    const broadcastResult = await broadcastProduct({
+      id: product.id,
+      title: data.title,
+      price: data.price,
+      originalPrice: data.originalPrice || null,
+      storeName: data.storeName || 'Loja',
+      category: data.category || null,
+    });
+
     let message = '✅ *Produto publicado com sucesso!*\n\n';
     message += `📝 ${data.title}\n`;
     message += `💰 R$ ${data.price.toFixed(2)}\n`;
@@ -652,6 +952,13 @@ async function publishProduct(ctx: Context, data: SessionData) {
     }
     if (data.couponCode) message += `🎟️ Cupom: ${data.couponCode}\n`;
     message += `\n🔗 ID: ${product.id}`;
+    
+    if (broadcastResult.success > 0 || broadcastResult.failed > 0) {
+      message += `\n\n📢 Enviado para ${broadcastResult.success} grupos`;
+      if (broadcastResult.failed > 0) {
+        message += ` (${broadcastResult.failed} falhas)`;
+      }
+    }
 
     await ctx.reply(message, { parse_mode: 'Markdown' });
 
